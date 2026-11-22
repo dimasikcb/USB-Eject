@@ -1,0 +1,634 @@
+﻿#requires -Version 5.1
+<#
+.SYNOPSIS
+  USB-Eject — принудительное извлечение USB-накопителей из консоли.
+.DESCRIPTION
+  1. Закрывает окна Проводника, открытые на выбранном диске.
+  2. Находит процессы, удерживающие файлы/том диска (скан хэндлов), показывает их
+     и предлагает завершить.
+  3. Блокирует и размонтирует том, затем выключает USB-устройство
+     (CM_Request_Device_Eject, при отказе — IOCTL_STORAGE_EJECT_MEDIA).
+.EXAMPLE
+  USB-Eject.bat                 # интерактивно: список дисков -> ввод буквы
+  USB-Eject.bat E               # сразу извлечь диск E:
+  powershell -File USB-Eject.ps1 -List       # только список USB-дисков
+  powershell -File USB-Eject.ps1 -Scan C     # показать, кто держит диск C: (только чтение)
+#>
+param(
+    [Parameter(Position = 0)]
+    [string]$Drive = '',
+    [switch]$List,
+    [switch]$Scan,
+    [switch]$Kill,
+    [switch]$Yes,
+    [switch]$NoPause
+)
+
+$ErrorActionPreference = 'Continue'
+try { [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false) } catch {}
+
+$script:IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not ('UsbEject.Native' -as [type])) {
+Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+
+namespace UsbEject
+{
+    public class OpenHandle
+    {
+        public int Pid;
+        public string Path;
+    }
+
+    public static class Native
+    {
+        [DllImport("ntdll.dll")] private static extern int NtQuerySystemInformation(int cls, IntPtr buf, int len, out int need);
+        [DllImport("ntdll.dll")] private static extern int NtQueryObject(IntPtr h, int cls, IntPtr buf, int len, out int need);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern bool DuplicateHandle(IntPtr srcProc, IntPtr src, IntPtr dstProc, out IntPtr dst, uint access, bool inherit, uint opts);
+        [DllImport("kernel32.dll")] private static extern IntPtr GetCurrentProcess();
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] private static extern uint GetFinalPathNameByHandleW(IntPtr h, [Out] StringBuilder path, uint len, uint flags);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] private static extern uint QueryDosDeviceW(string name, StringBuilder target, int max);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] private static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern bool DeviceIoControl(IntPtr h, uint code, IntPtr inBuf, uint inSize, IntPtr outBuf, uint outSize, out uint ret, IntPtr ov);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern bool FlushFileBuffers(IntPtr h);
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+        [DllImport("user32.dll")] private static extern bool EnumWindows(EnumWindowsProc cb, IntPtr lParam);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassNameW(IntPtr h, StringBuilder cls, int max);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowTextW(IntPtr h, StringBuilder txt, int max);
+        [DllImport("user32.dll")] private static extern bool PostMessageW(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
+        [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)] private static extern int CM_Request_Device_EjectW(string deviceId, out int vetoType, StringBuilder vetoName, uint vetoNameLength, uint flags);
+        [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)] private static extern int CM_Locate_DevNodeW(out int devInst, string deviceId, uint flags);
+        [DllImport("cfgmgr32.dll")] private static extern int CM_Get_Parent(out int parent, int devInst, uint flags);
+        [DllImport("cfgmgr32.dll", CharSet = CharSet.Unicode)] private static extern int CM_Get_Device_IDW(int devInst, StringBuilder id, int len, uint flags);
+
+        private const int SystemExtendedHandleInformation = 64;
+        private const int StatusInfoLengthMismatch = unchecked((int)0xC0000004);
+        private const uint ProcessDupHandle = 0x0040;
+        private const uint DuplicateSameAccess = 0x0002;
+        private const uint GenericRead = 0x80000000;
+        private const uint GenericWrite = 0x40000000;
+        private const uint ShareReadWriteDelete = 0x7;
+        private const uint OpenExisting = 3;
+        private const uint FsctlLockVolume = 0x00090018;
+        private const uint FsctlDismountVolume = 0x0009001C;
+        private const uint IoctlStorageEjectMedia = 0x002D4808;
+        private const uint WmClose = 0x0010;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct HandleEntryEx
+        {
+            public ulong Object;
+            public ulong ProcessId;
+            public IntPtr Handle;
+            public uint GrantedAccess;
+            public ushort CreatorBackTraceIndex;
+            public ushort ObjectTypeIndex;
+            public uint HandleAttributes;
+            public uint Reserved;
+        }
+
+        private static string ReadUnicodeString(IntPtr infoBuffer)
+        {
+            short len = Marshal.ReadInt16(infoBuffer, 0);
+            IntPtr str = Marshal.ReadIntPtr(infoBuffer, IntPtr.Size);
+            if (len <= 0 || str == IntPtr.Zero) return null;
+            return Marshal.PtrToStringUni(str, len / 2);
+        }
+
+        private static string PathWithTimeout(IntPtr dup, int timeoutMs, out bool timedOut)
+        {
+            timedOut = false;
+            var sb = new StringBuilder(4096);
+            int got = 0;
+            var t = new Thread(delegate() { try { got = (int)GetFinalPathNameByHandleW(dup, sb, 4096, 0); } catch { } });
+            t.IsBackground = true;
+            t.Start();
+            if (!t.Join(timeoutMs)) { timedOut = true; return null; }
+            return got > 0 ? sb.ToString() : null;
+        }
+
+        private static string NtNameWithTimeout(IntPtr dup, int timeoutMs, out bool timedOut)
+        {
+            timedOut = false;
+            IntPtr buf = Marshal.AllocHGlobal(4096);
+            try
+            {
+                string name = null;
+                var t = new Thread(delegate() { try { int need; if (NtQueryObject(dup, 1 /*ObjectNameInformation*/, buf, 4096, out need) == 0) name = ReadUnicodeString(buf); } catch { } });
+                t.IsBackground = true;
+                t.Start();
+                if (!t.Join(timeoutMs)) { timedOut = true; return null; }
+                return name;
+            }
+            finally { Marshal.FreeHGlobal(buf); }
+        }
+
+        // Находит открытые дескрипторы (файлы/том), относящиеся к заданному диску.
+        public static List<OpenHandle> FindOpenHandles(char letter, int currentPid, string[] extraPrefixes, out int leaked)
+        {
+            leaked = 0;
+            var result = new List<OpenHandle>();
+            string dosPrefix = letter.ToString().ToLowerInvariant() + ":";
+            string volDos = ("\\\\.\\" + letter + ":").ToLowerInvariant();
+            var qd = new StringBuilder(1024);
+            var prefixes = new List<string>();
+            prefixes.Add(dosPrefix);
+            prefixes.Add(volDos);
+            if (QueryDosDeviceW(letter + ":", qd, 1024) > 0 && qd.Length > 0)
+                prefixes.Add(qd.ToString().ToLowerInvariant());
+            if (extraPrefixes != null)
+                foreach (string p in extraPrefixes)
+                    if (!string.IsNullOrEmpty(p)) prefixes.Add(p.ToLowerInvariant());
+
+            int len = 0x400000;
+            IntPtr buf = IntPtr.Zero;
+            int status = StatusInfoLengthMismatch, need;
+            while (true)
+            {
+                buf = Marshal.AllocHGlobal(len);
+                status = NtQuerySystemInformation(SystemExtendedHandleInformation, buf, len, out need);
+                if (status == StatusInfoLengthMismatch)
+                {
+                    Marshal.FreeHGlobal(buf);
+                    buf = IntPtr.Zero;
+                    len = need > len ? need : len * 2;
+                    if (len > 0x10000000) break;
+                    continue;
+                }
+                break;
+            }
+            if (status != 0 || buf == IntPtr.Zero) return result;
+
+            try
+            {
+                long count = Marshal.ReadIntPtr(buf).ToInt64();
+                int entrySize = Marshal.SizeOf(typeof(HandleEntryEx));
+                long baseAddr = buf.ToInt64() + IntPtr.Size * 2;
+                var procCache = new Dictionary<int, IntPtr>();
+                int stuck = 0;
+                for (long i = 0; i < count; i++)
+                {
+                    if (stuck > 200) break;
+                    var entry = (HandleEntryEx)Marshal.PtrToStructure(new IntPtr(baseAddr + i * entrySize), typeof(HandleEntryEx));
+                    int pid = (int)(entry.ProcessId & 0xFFFFFFFFL);
+                    if (pid <= 4 || pid == currentPid) continue;
+                    if ((entry.GrantedAccess & 0x0012019F) == 0) continue;
+
+                    IntPtr proc;
+                    if (!procCache.TryGetValue(pid, out proc))
+                    {
+                        proc = OpenProcess(ProcessDupHandle, false, pid);
+                        procCache[pid] = proc;
+                    }
+                    if (proc == IntPtr.Zero) continue;
+
+                    IntPtr dup;
+                    if (!DuplicateHandle(proc, entry.Handle, GetCurrentProcess(), out dup, 0, false, DuplicateSameAccess)) continue;
+
+                    string typeName = null;
+                    IntPtr tbuf = Marshal.AllocHGlobal(4096);
+                    try
+                    {
+                        int tneed;
+                        if (NtQueryObject(dup, 2 /*ObjectTypeInformation*/, tbuf, 4096, out tneed) == 0) typeName = ReadUnicodeString(tbuf);
+                    }
+                    finally { Marshal.FreeHGlobal(tbuf); }
+                    if (typeName != "File") { CloseHandle(dup); continue; }
+
+                    bool timedOut;
+                    string path = PathWithTimeout(dup, 200, out timedOut);
+                    if (timedOut) { leaked++; stuck++; continue; }
+                    if (string.IsNullOrEmpty(path))
+                    {
+                        bool timedOut2;
+                        path = NtNameWithTimeout(dup, 200, out timedOut2);
+                        if (timedOut2) { leaked++; stuck++; continue; }
+                        if (string.IsNullOrEmpty(path)) { CloseHandle(dup); continue; }
+                    }
+
+                    string low = path.ToLowerInvariant();
+                    if (low.StartsWith(@"\\?\")) low = low.Substring(4);
+
+                    bool match = false;
+                    foreach (string p in prefixes)
+                    {
+                        if (low == p || low.StartsWith(p + "\\")) { match = true; break; }
+                    }
+                    if (!match) { CloseHandle(dup); continue; }
+
+                    result.Add(new OpenHandle { Pid = pid, Path = path });
+                }
+            }
+            finally { Marshal.FreeHGlobal(buf); }
+            return result;
+        }
+
+        // Извлечение через диспетчер устройств (то же, что "безопасное извлечение").
+        private static string TryCmEject(string instanceId)
+        {
+            if (string.IsNullOrEmpty(instanceId)) return "нет идентификатора устройства (InstanceId)";
+            int vetoType;
+            var veto = new StringBuilder(512);
+            int cr = CM_Request_Device_EjectW(instanceId, out vetoType, veto, (uint)veto.Capacity, 0);
+            if (cr == 0) return null;
+            int devInst, parent;
+            var id = new StringBuilder(1024);
+            if (CM_Locate_DevNodeW(out devInst, instanceId, 0) == 0 &&
+                CM_Get_Parent(out parent, devInst, 0) == 0 &&
+                CM_Get_Device_IDW(parent, id, id.Capacity, 0) == 0)
+            {
+                int vetoType2;
+                var veto2 = new StringBuilder(512);
+                if (CM_Request_Device_EjectW(id.ToString(), out vetoType2, veto2, (uint)veto2.Capacity, 0) == 0) return null;
+            }
+            return "код " + cr + (veto.Length > 0 ? ", veto: " + veto.ToString() : "");
+        }
+
+        // Резерв: команда EJECT самому физическому диску.
+        private static string TryIoctlEject(string physicalDrive)
+        {
+            if (string.IsNullOrEmpty(physicalDrive)) return "нет пути физического диска";
+            IntPtr d = CreateFileW(physicalDrive, GenericRead | GenericWrite, 0x3, IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
+            if (d == IntPtr.Zero || d == new IntPtr(-1)) return "не удалось открыть " + physicalDrive + " (ошибка " + Marshal.GetLastWin32Error() + ")";
+            try
+            {
+                uint ret;
+                if (DeviceIoControl(d, IoctlStorageEjectMedia, IntPtr.Zero, 0, IntPtr.Zero, 0, out ret, IntPtr.Zero)) return null;
+                return "ошибка " + Marshal.GetLastWin32Error();
+            }
+            finally { CloseHandle(d); }
+        }
+
+        // Полный цикл: сброс кэша -> блокировка/размонтирование тома -> выключение устройства.
+        public static string EjectDevice(char letter, string instanceId, string physicalDrive)
+        {
+            string volName = "\\\\.\\" + letter + ":";
+            IntPtr h = CreateFileW(volName, GenericRead | GenericWrite, ShareReadWriteDelete, IntPtr.Zero, OpenExisting, 0, IntPtr.Zero);
+            bool haveVol = (h != IntPtr.Zero && h != new IntPtr(-1));
+            if (!haveVol)
+            {
+                string m = TryCmEject(instanceId);
+                if (m == null) return null;
+                m = TryIoctlEject(physicalDrive);
+                if (m == null) return null;
+                return "не удалось открыть том " + volName + " (ошибка " + Marshal.GetLastWin32Error() + "); " + m;
+            }
+            try
+            {
+                uint ret;
+                try { FlushFileBuffers(h); } catch { }
+                bool locked = DeviceIoControl(h, FsctlLockVolume, IntPtr.Zero, 0, IntPtr.Zero, 0, out ret, IntPtr.Zero);
+                bool dismounted = false;
+                if (!locked)
+                {
+                    dismounted = DeviceIoControl(h, FsctlDismountVolume, IntPtr.Zero, 0, IntPtr.Zero, 0, out ret, IntPtr.Zero);
+                    if (dismounted)
+                        locked = DeviceIoControl(h, FsctlLockVolume, IntPtr.Zero, 0, IntPtr.Zero, 0, out ret, IntPtr.Zero);
+                }
+                string m = TryCmEject(instanceId);
+                if (m == null) return null;
+                m = TryIoctlEject(physicalDrive);
+                if (m == null) return null;
+                if (dismounted)
+                    return "том размонтирован, но устройство не выключено (" + m + ")";
+                return "том занят: не удалось заблокировать/размонтировать (" + m + ")";
+            }
+            finally { CloseHandle(h); }
+        }
+
+        // Закрытие окон Проводника, открытых на корне диска (заголовок вида "Tom (E:)").
+        public static int CloseExplorerWindows(char letter)
+        {
+            int closed = 0;
+            string needle = "(" + letter.ToString().ToLowerInvariant() + ":)";
+            EnumWindows(delegate(IntPtr h, IntPtr lp)
+            {
+                var cls = new StringBuilder(256);
+                GetClassNameW(h, cls, 256);
+                string c = cls.ToString();
+                if (c != "CabinetWClass" && c != "ExploreWClass") return true;
+                var txt = new StringBuilder(512);
+                GetWindowTextW(h, txt, 512);
+                if (txt.ToString().ToLowerInvariant().Contains(needle))
+                {
+                    if (PostMessageW(h, WmClose, IntPtr.Zero, IntPtr.Zero)) closed++;
+                }
+                return true;
+            }, IntPtr.Zero);
+            return closed;
+        }
+    }
+}
+'@
+}
+
+# ---------- Вспомогательные функции ----------
+
+function Get-Targets {
+    $out = @()
+    $seen = @{}
+    $diskDevs = @(Get-CimInstance Win32_DiskDrive -ErrorAction SilentlyContinue)
+    $storageDisks = @()
+    try { $storageDisks = @(Get-Disk -ErrorAction SilentlyContinue | Where-Object { $_.BusType -eq 'USB' }) } catch {}
+    foreach ($d in $storageDisks) {
+        $dev = $diskDevs | Where-Object { $null -ne $_.Index -and [int]$_.Index -eq [int]$d.Number } | Select-Object -First 1
+        $letters = @()
+        try {
+            $letters = @(Get-Partition -DiskNumber ([int]$d.Number) -ErrorAction Stop | Where-Object { $_.DriveLetter } | ForEach-Object { $_.DriveLetter })
+        } catch {}
+        foreach ($l in $letters) {
+            $lc = [char]$l
+            if ($seen.ContainsKey($lc)) { continue }
+            $seen[$lc] = $true
+            $v = Get-Volume -DriveLetter $lc -ErrorAction SilentlyContinue
+            $out += [pscustomobject]@{
+                Letter        = $lc
+                Label         = $(if ($v -and $v.FileSystemLabel) { $v.FileSystemLabel } else { '(без метки)' })
+                FS            = $(if ($v) { $v.FileSystem } else { '?' })
+                SizeGB        = $(if ($v) { [math]::Round($v.Size / 1GB, 1) } else { 0 })
+                Model         = $d.FriendlyName
+                DiskNumber    = [int]$d.Number
+                InstanceId    = $(if ($dev) { $dev.PNPDeviceID } else { $null })
+                PhysicalDrive = "\\.\PhysicalDrive$($d.Number)"
+            }
+        }
+    }
+    try {
+        foreach ($ld in @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=2' -ErrorAction SilentlyContinue)) {
+            $lc = [char]([string]$ld.DeviceID[0])
+            if ($seen.ContainsKey($lc)) { continue }
+            $seen[$lc] = $true
+            $part = Get-Partition -DriveLetter $lc -ErrorAction SilentlyContinue
+            $dev = $null; $dn = $null
+            if ($part) {
+                $dn = [int]$part.DiskNumber
+                $dev = $diskDevs | Where-Object { $null -ne $_.Index -and [int]$_.Index -eq $dn } | Select-Object -First 1
+            }
+            $out += [pscustomobject]@{
+                Letter        = $lc
+                Label         = $(if ($ld.VolumeName) { $ld.VolumeName } else { '(без метки)' })
+                FS            = $ld.FileSystem
+                SizeGB        = $(if ($ld.Size) { [math]::Round($ld.Size / 1GB, 1) } else { 0 })
+                Model         = 'Съёмный носитель'
+                DiskNumber    = $dn
+                InstanceId    = $(if ($dev) { $dev.PNPDeviceID } else { $null })
+                PhysicalDrive = $(if ($null -ne $dn) { "\\.\PhysicalDrive$dn" } else { $null })
+            }
+        }
+    } catch {}
+    return @($out)
+}
+
+function Show-Targets {
+    param($Targets)
+    Write-Host ""
+    Write-Host "USB / съёмные диски:" -ForegroundColor Cyan
+    if (-not $Targets -or $Targets.Count -eq 0) {
+        Write-Host "  (не найдено — подключите накопитель и перезапустите)" -ForegroundColor DarkGray
+        return
+    }
+    foreach ($t in $Targets) {
+        Write-Host ("  {0}: «{1}»  {2}  {3} GB, {4}  (диск #{5})" -f $t.Letter, $t.Label, $t.FS, $t.SizeGB, $t.Model, $t.DiskNumber)
+    }
+}
+
+function Close-ExplorerWindows {
+    param([char]$Letter)
+    $closed = 0
+    try {
+        $shell = New-Object -ComObject Shell.Application
+        $low = $Letter.ToString().ToLower()
+        foreach ($w in @($shell.Windows())) {
+            try {
+                $path = $null
+                if ($w.Document -and $w.Document.Folder) { $path = $w.Document.Folder.Self.Path }
+                if (-not $path) {
+                    $u = $null; try { $u = $w.LocationURL } catch {}
+                    if ($u -and $u.ToLower().StartsWith("file:///$low")) { $path = "$($Letter):" }
+                }
+                if ($path) {
+                    $pl = $path.ToLower()
+                    if ($pl.StartsWith("$low") -or $pl.StartsWith("\\?\$low") -or $pl.StartsWith("\\.\$low")) {
+                        $w.Quit(); $closed++
+                    }
+                }
+            } catch {}
+        }
+    } catch {}
+    $closed += [UsbEject.Native]::CloseExplorerWindows($Letter)
+    return $closed
+}
+
+function Get-BlockingProcesses {
+    param([char]$Letter, [string[]]$ExtraPrefixes = @())
+    $leaked = 0
+    $raw = [UsbEject.Native]::FindOpenHandles($Letter, $PID, $ExtraPrefixes, [ref]$leaked)
+    $out = @()
+    foreach ($g in @($raw | Group-Object -Property Pid)) {
+        $proc = Get-Process -Id ([int]$g.Name) -ErrorAction SilentlyContinue
+        $paths = @($g.Group | ForEach-Object { $_.Path } | ForEach-Object { if ($_.StartsWith('\\?\')) { $_.Substring(4) } else { $_ } } | Select-Object -Unique)
+        $out += [pscustomobject]@{
+            Pid   = [int]$g.Name
+            Name  = $(if ($proc) { $proc.ProcessName } else { '?' })
+            Title = $(if ($proc -and $proc.MainWindowTitle) { $proc.MainWindowTitle } else { '' })
+            Files = $paths.Count
+            Paths = (($paths | Select-Object -First 6) -join "`n      ")
+        }
+    }
+    [pscustomobject]@{ Processes = @($out | Sort-Object Name, Pid); Leaked = $leaked }
+}
+
+function Test-SpecialUse {
+    param([char]$Letter)
+    $notes = @()
+    try {
+        foreach ($pf in @(Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue)) {
+            if ($pf.Name -and $pf.Name.ToUpper().StartsWith([string]$Letter + ':')) {
+                $notes += "на диске находится файл подкачки ($($pf.Name)) — пока он там, извлечение невозможно"
+            }
+        }
+    } catch {}
+    if (Test-Path ($Letter.ToString() + ':\ReadyBoost.sfcf')) {
+        $notes += "диск используется ReadyBoost — отключите его в свойствах диска"
+    }
+    return $notes
+}
+
+# ---------- Основной сценарий ----------
+
+try {
+    Write-Host "=== USB-Eject — безопасное/принудительное извлечение USB-дисков ===" -ForegroundColor Cyan
+    if (-not $script:IsAdmin) {
+        Write-Host "! Нет прав администратора: принудительное извлечение может не сработать." -ForegroundColor Yellow
+        Write-Host "  Лучше запускать через USB-Eject.bat — он сам запросит права." -ForegroundColor Yellow
+    }
+
+    $targets = @(Get-Targets)
+
+    if ($List) { Show-Targets $targets; exit 0 }
+
+    if ($Scan) {
+        $l = if ($Drive) { [char]($Drive.TrimEnd(':', '\').Substring(0, 1).ToUpper()) } else { [char]'C' }
+        Write-Host ""
+        Write-Host "Сканирую открытые дескрипторы на диске $($l):\ (может занять до минуты)..." -ForegroundColor Cyan
+        $dn = $null
+        try { $dn = Get-Partition -DriveLetter $l -ErrorAction Stop | Select-Object -ExpandProperty DiskNumber -First 1 } catch {}
+        $extra = @()
+        if ($null -ne $dn) { $extra = @("\\.\PhysicalDrive$dn", "\Device\Harddisk$dn") }
+        $res = Get-BlockingProcesses -Letter $l -ExtraPrefixes $extra
+        $procs = $res.Processes
+        Write-Host ""
+        if ($procs.Count -eq 0) {
+            Write-Host "Блокирующие процессы не найдены." -ForegroundColor Green
+        } else {
+            Write-Host ("Процессов, держащих диск: {0}" -f $procs.Count) -ForegroundColor Yellow
+            $procs | Select-Object -First 60 | ForEach-Object {
+                Write-Host ("  - {0} (PID {1}){2} — файлов: {3}" -f $_.Name, $_.Pid, $(if ($_.Title) { " «$($_.Title)»" } else { '' }), $_.Files)
+                if ($_.Paths) { Write-Host "      $($_.Paths)" -ForegroundColor DarkGray }
+            }
+        }
+        if ($res.Leaked -gt 0) { Write-Host "(пропущено зависших дескрипторов: $($res.Leaked))" -ForegroundColor DarkGray }
+        exit 0
+    }
+
+    if (-not $Drive) {
+        Show-Targets $targets
+        Write-Host ""
+        $sel = Read-Host "Буква диска для извлечения (Enter = выход)"
+        if (-not $sel) { exit 0 }
+        $Drive = $sel
+    }
+
+    $letter = [char]($Drive.TrimEnd(':', '\').Substring(0, 1).ToUpper())
+    $target = $targets | Where-Object { $_.Letter -eq $letter } | Select-Object -First 1
+    if (-not $target) {
+        $v = Get-Volume -DriveLetter $letter -ErrorAction SilentlyContinue
+        if ($v) {
+            $dn = $null
+            try { $dn = Get-Partition -DriveLetter $letter -ErrorAction Stop | Select-Object -ExpandProperty DiskNumber -First 1 } catch {}
+            $dev = $null
+            if ($null -ne $dn) {
+                $dev = @(Get-CimInstance Win32_DiskDrive -ErrorAction SilentlyContinue) | Where-Object { $null -ne $_.Index -and [int]$_.Index -eq [int]$dn } | Select-Object -First 1
+            }
+            $target = [pscustomobject]@{
+                Letter        = $letter
+                Label         = $(if ($v.FileSystemLabel) { $v.FileSystemLabel } else { '(без метки)' })
+                FS            = $v.FileSystem
+                SizeGB        = [math]::Round($v.Size / 1GB, 1)
+                Model         = '?'
+                DiskNumber    = $dn
+                InstanceId    = $(if ($dev) { $dev.PNPDeviceID } else { $null })
+                PhysicalDrive = $(if ($null -ne $dn) { "\\.\PhysicalDrive$dn" } else { $null })
+            }
+        }
+    }
+    if (-not $target) {
+        Write-Host "Диск $($letter): не найден или не подключён." -ForegroundColor Red
+        exit 1
+    }
+
+    if ($letter -eq 'C') {
+        Write-Host "ВНИМАНИЕ: $($letter): — системный диск, извлечь его нельзя (это опасно)." -ForegroundColor Red
+        $a = Read-Host "Продолжить всё равно? [y/N]"
+        if ($a -notin @('y', 'д', 'да', 'yes')) { exit 0 }
+    }
+
+    foreach ($n in (Test-SpecialUse $letter)) { Write-Host "! $n" -ForegroundColor Yellow }
+
+    Write-Host ""
+    Write-Host ("Цель: {0}: «{1}»  [{2}]" -f $letter, $target.Label, $target.Model) -ForegroundColor Cyan
+
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        Write-Host ""
+        Write-Host "--- Попытка $attempt ---" -ForegroundColor DarkCyan
+
+        $closed = Close-ExplorerWindows -Letter $letter
+        if ($closed -gt 0) { Write-Host "Закрыто окон Проводника на диске $($letter): : $closed" -ForegroundColor Green }
+        Start-Sleep -Milliseconds 300
+
+        Write-Host "Ищу процессы, удерживающие диск (до ~минуты)..." -ForegroundColor Cyan
+        $extra = @()
+        if ($null -ne $target.DiskNumber) { $extra = @("\\.\PhysicalDrive$($target.DiskNumber)", "\Device\Harddisk$($target.DiskNumber)") }
+        $res = Get-BlockingProcesses -Letter $letter -ExtraPrefixes $extra
+        $procs = $res.Processes
+
+        if ($procs.Count -gt 0) {
+            Write-Host "Диск держат следующие процессы:" -ForegroundColor Yellow
+            foreach ($p in $procs) {
+                Write-Host ("  - {0} (PID {1}){2} — файлов: {3}" -f $p.Name, $p.Pid, $(if ($p.Title) { " «$($p.Title)»" } else { '' }), $p.Files)
+                if ($p.Paths) { Write-Host "      $($p.Paths)" -ForegroundColor DarkGray }
+            }
+        } else {
+            Write-Host "Явных блокирующих процессов не найдено (возможно, диск держит система/драйвер)." -ForegroundColor DarkGray
+        }
+
+        $neverKill = @('winlogon', 'csrss', 'smss', 'services', 'lsass', 'wininit', 'MemCompression', 'Registry', 'System', 'Idle')
+        $killable = @($procs | Where-Object { $_.Name -notin @('explorer', '?') -and $_.Name -notin $neverKill })
+        $sysProcs = @($procs | Where-Object { $_.Name -in $neverKill })
+        $expl = @($procs | Where-Object { $_.Name -eq 'explorer' })
+
+        if ($sysProcs.Count -gt 0) {
+            Write-Host "  (!) Диск держит защищённый системный процесс — его завершать нельзя;" -ForegroundColor DarkYellow
+            Write-Host "      принудительное размонтирование ниже обычно всё равно срабатывает." -ForegroundColor DarkYellow
+        }
+
+        if ($killable.Count -gt 0) {
+            $doKill = [bool]($Kill -or $Yes)
+            if (-not $doKill) { $a = Read-Host "  Завершить перечисленные процессы? [Y/n]"; $doKill = $a -notin @('n', 'н', 'no', 'нет') }
+            if ($doKill) {
+                foreach ($k in $killable) {
+                    try {
+                        Stop-Process -Id $k.Pid -Force -ErrorAction Stop
+                        Write-Host ("  [ok] завершён: {0} (PID {1})" -f $k.Name, $k.Pid) -ForegroundColor Green
+                    } catch {
+                        Write-Host ("  [!!] не удалось завершить {0} (PID {1}): {2}" -f $k.Name, $k.Pid, $_.Exception.Message) -ForegroundColor Yellow
+                    }
+                }
+                Start-Sleep -Milliseconds 800
+            }
+        }
+        if ($expl.Count -gt 0) {
+            $doE = [bool]$Kill
+            if (-not $doE -and -not $Yes) { $a = Read-Host "  Перезапустить Проводник (частая причина блокировки)? [y/N]"; $doE = $a -in @('y', 'д', 'да', 'yes') }
+            if ($doE) {
+                Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 1
+                if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) { Start-Process explorer.exe }
+                Write-Host "  [ok] Проводник перезапущен" -ForegroundColor Green
+            }
+        }
+
+        Write-Host "Пытаюсь извлечь устройство..." -ForegroundColor Cyan
+        $err = [UsbEject.Native]::EjectDevice($letter, $target.InstanceId, $target.PhysicalDrive)
+        if (-not $err) {
+            Write-Host ""
+            Write-Host ("[OK] Готово! Диск {0}: («{1}») безопасно извлечён — можно отсоединять." -f $letter, $target.Label) -ForegroundColor Green
+            break
+        }
+        Write-Host "[!!] Не получилось: $err" -ForegroundColor Red
+        if ($attempt -ge 3) {
+            Write-Host "Подсказки: закройте программы из списка выше и открытые файлы с диска;" -ForegroundColor Yellow
+            Write-Host "если ничего не помогает — перезайдите в Windows или перезагрузите ПК." -ForegroundColor Yellow
+            break
+        }
+        $a = Read-Host "Повторить попытку? [Y/n]"
+        if ($a -in @('n', 'н', 'no', 'нет')) { break }
+    }
+}
+catch {
+    Write-Host ""
+    Write-Host "Ошибка: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host $_.ScriptStackTrace -ForegroundColor DarkGray
+}
+finally {
+    if (-not $NoPause) { try { [void](Read-Host "`nНажмите Enter для выхода") } catch {} }
+}
