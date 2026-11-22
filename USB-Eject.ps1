@@ -731,6 +731,27 @@ try {
         exit 0
     }
 
+    function Show-NumberedTargets {
+        param($Targets)
+        $i = 0
+        foreach ($t in $Targets) {
+            $i++
+            Write-Host ("  [{0}] {1}: «{2}»  {3}  {4} GB, {5}" -f $i, $t.Letter, $t.Label, $t.FS, $t.SizeGB, $t.Model)
+        }
+    }
+
+    function Resolve-Selection {
+        param([string]$InputText, $Targets)
+        $s = ([string]$InputText).Trim()
+        if ($s -match '^\d+$') {
+            $n = [int]$s
+            $arr = @($Targets)
+            if ($n -ge 1 -and $n -le $arr.Count) { return $arr[$n - 1] }
+            return $null
+        }
+        return (Resolve-TargetByInput -InputText $s -Targets $Targets)
+    }
+
     function Resolve-TargetByInput {
         param([string]$InputText, $Targets)
         $s = ([string]$InputText).Trim().TrimEnd(':', '\')
@@ -760,22 +781,39 @@ try {
         return $null
     }
 
-    # Выбор диска: неправильная буква -> переспрашиваем, пока не введёт существующую
-    $sel = $Drive
-    if (-not $sel) {
-        Show-Targets $targets
-        Write-Host ""
-        $sel = Read-Host "Буква диска для извлечения (Enter = выход)"
+    # Выбор диска: один — берём сами, несколько — меню с цифрами, буква тоже принимается
+    $target = $null
+    if ($Drive) {
+        $target = Resolve-TargetByInput -InputText $Drive -Targets $targets
+        while (-not $target) {
+            Write-Host ""
+            Write-Host "Диск '$($Drive.Trim())' не найден. Есть:" -ForegroundColor Red
+            Show-NumberedTargets $targets
+            $sel = Read-Host "Выбери цифру или букву диска (Enter = выход)"
+            if (-not $sel) { exit 0 }
+            $target = Resolve-Selection -InputText $sel -Targets $targets
+        }
     }
-    $target = Resolve-TargetByInput -InputText $sel -Targets $targets
-    while (-not $target) {
+    elseif ($targets.Count -eq 1) {
+        $target = $targets[0]
+    }
+    elseif ($targets.Count -gt 1) {
+        Show-NumberedTargets $targets
         Write-Host ""
-        Write-Host "Диск '$($sel.Trim())' не найден или не подключён. Есть:" -ForegroundColor Red
+        $sel = Read-Host "Какой диск извлечь? (цифра или буква, Enter = выход)"
+        $target = Resolve-Selection -InputText $sel -Targets $targets
+        while (-not $target) {
+            if (-not $sel) { exit 0 }
+            Write-Host "Нет такого варианта. Есть:" -ForegroundColor Red
+            Show-NumberedTargets $targets
+            $sel = Read-Host "Выбери цифру или букву (Enter = выход)"
+            if (-not $sel) { exit 0 }
+            $target = Resolve-Selection -InputText $sel -Targets $targets
+        }
+    }
+    else {
         Show-Targets $targets
-        Write-Host ""
-        $sel = Read-Host "Введи букву диска ещё раз (Enter = выход)"
-        if (-not $sel) { exit 0 }
-        $target = Resolve-TargetByInput -InputText $sel -Targets $targets
+        exit 0
     }
     $letter = $target.Letter
 
@@ -807,40 +845,7 @@ try {
             Write-Host ""
             Show-Blockers -Procs $procs
             Show-Verdict -Procs $procs
-
-            $actionable = @($procs | Where-Object { $_.Category -ne 'system' })
-            if ($actionable.Count -gt 0) {
-                if ($Kill -or $Yes) {
-                    Write-Host ""
-                    Write-Host "Режим -Kill/-Yes: останавливаю найденные программы и службы..." -ForegroundColor Cyan
-                    Invoke-StopBlockers -Items $actionable
-                } else {
-                    Write-Host ""
-                    $ans = Read-Host "  Что остановить? (номера через запятую | A - все, кроме системных | S - только службы | W - Проводник | Enter - ничего)"
-                    $selected = @()
-                    $wantSvc = $false
-                    $wantExp = $false
-                    foreach ($t in @(($ans -split '[,;\s]+' | Where-Object { $_ }))) {
-                        $tu = $t.Trim().ToUpper()
-                        if ($tu -eq 'A' -or $tu -eq 'А') { $selected = @($actionable); break }
-                        elseif ($tu -eq 'S' -or $tu -eq 'С') { $wantSvc = $true }
-                        elseif ($tu -eq 'W') { $wantExp = $true }
-                        elseif ($tu -match '^\d+$') {
-                            $m = @($actionable | Where-Object { $_.Num -eq ([int]$tu) })
-                            if ($m.Count -gt 0) { $selected += $m }
-                            else { Write-Host "  (пункт $tu не найден или это системный процесс)" -ForegroundColor DarkGray }
-                        }
-                    }
-                    if ($wantSvc) { $selected += @($actionable | Where-Object { $_.Category -eq 'service' }) }
-                    if ($wantExp) { $selected += @($actionable | Where-Object { $_.Category -eq 'explorer' }) }
-                    $selected = @($selected | Sort-Object Pid -Unique)
-                    if ($selected.Count -gt 0) {
-                        Invoke-StopBlockers -Items $selected
-                    } else {
-                        Write-Host "  Ничего не останавливаю." -ForegroundColor DarkGray
-                    }
-                }
-            } else {
+            if (@($procs | Where-Object { $_.Category -ne 'system' }).Count -eq 0) {
                 Write-Host ""
                 Write-Host "  Держат только защищённые системные процессы — их не трогаем." -ForegroundColor DarkYellow
             }
@@ -857,6 +862,14 @@ try {
                 break
             }
             $ejectConfirmed = $true
+        }
+
+        # Согласие получено — автоматически освобождаем диск и извлекаем
+        $actionable = @($procs | Where-Object { $_.Category -ne 'system' })
+        if ($actionable.Count -gt 0) {
+            Write-Host ""
+            Write-Host "Освобождаю диск: останавливаю найденные программы и службы..." -ForegroundColor Cyan
+            Invoke-StopBlockers -Items $actionable
         }
 
         $closed = Close-ExplorerWindows -Letter $letter
